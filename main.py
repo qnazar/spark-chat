@@ -2,6 +2,7 @@ from flask import Flask, request
 from flask_socketio import SocketIO, join_room, emit, close_room
 from models import db, User
 from config import Config
+from sqlalchemy.exc import SQLAlchemyError
 
 import eventlet
 
@@ -15,7 +16,6 @@ socketio = SocketIO(app, cors_allowed_origins='*', async_mode='eventlet')
 
 with app.app_context():
     db.create_all()
-    print('db created tables')
 
 
 def build_graph():
@@ -35,7 +35,6 @@ def build_graph():
 
 def load_chats(user: User):
     chats = [u.username for u in user.connects]
-    print(chats)
     return chats
 
 
@@ -48,21 +47,22 @@ def connect_user():
 def login_user(data):
     user = User.query.get(data['username'])
 
-    # first ever visiting (new node of this user + total graph) / other users get push for node
     if not user:
-        user = User(username=data['username'],
-                    password=data['password'],
-                    session_id=request.sid,
-                    is_active=True)
-        db.session.add(user)
-        db.session.commit()
-        chats = []
-        graph = build_graph()
-        join_room(user.username, sid=request.sid)
-        emit('registration', {'username': user.username, 'chats': chats, 'graph': graph}, to=user.username)
-        emit('new node', {'username': user.username, 'is_active': user.is_active}, broadcast=True, include_self=False)
+        try:
+            user = User(username=data['username'],
+                        password=data['password'],
+                        session_id=request.sid,
+                        is_active=True)
+            db.session.add(user)
+            db.session.commit()
+            chats = []
+            graph = build_graph()
+            join_room(user.username, sid=request.sid)
+            emit('registration', {'username': user.username, 'chats': chats, 'graph': graph}, to=user.username)
+            emit('new node', {'username': user.username, 'is_active': user.is_active}, broadcast=True, include_self=False)
+        except SQLAlchemyError as e:
+            print(e)
 
-    # log in (changing thus user status to active and sending total graph)
     elif user.password == data['password']:
         user.session_id = request.sid
         user.is_active = True
@@ -80,7 +80,6 @@ def login_user(data):
 
 @socketio.on('add chat')
 def add_chat(data):
-    # TODO forbid adding repeated entries
     user: User = User.query.get(data['current_user'])
     new_contact: User = User.query.get(data['to_user'])
     if new_contact:
@@ -110,7 +109,6 @@ def message(data):
 
 @socketio.on('disconnect')
 def disconnect_user():
-    print('disconnected')
     user = User.query.filter_by(session_id=request.sid).first()
     if user:
         user.session_id = None
