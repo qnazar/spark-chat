@@ -19,6 +19,7 @@ class User(db.Model):
 
     username = Column(String(32), primary_key=True)
     password = Column(String(128), nullable=False)
+    session_id = Column(String(128), nullable=True)
     is_active = Column(Boolean)
 
     connects = relationship(

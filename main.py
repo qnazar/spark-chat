@@ -1,8 +1,7 @@
 from flask import Flask, request
-from flask_socketio import SocketIO, join_room
+from flask_socketio import SocketIO, join_room, emit, close_room
 from models import db, User
 from config import Config
-from flask_session import Session
 
 import eventlet
 
@@ -10,7 +9,6 @@ import eventlet
 eventlet.monkey_patch()
 app = Flask(__name__)
 app.config.from_object(Config)
-app.config['SESSION_TYPE'] = 'filesystem'
 
 db.init_app(app)
 socketio = SocketIO(app, cors_allowed_origins='*', async_mode='eventlet')
@@ -18,9 +16,6 @@ socketio = SocketIO(app, cors_allowed_origins='*', async_mode='eventlet')
 with app.app_context():
     db.create_all()
     print('db created tables')
-
-
-users = {}
 
 
 def build_graph():
@@ -45,67 +40,84 @@ def load_chats(user: User):
 
 
 @socketio.on('connection')
-def connect_user(message):
-    users[request.sid] = None
-    print('connected')
-
-
-@socketio.on('disconnect')
-def disconnect_user():
-    print('disconnected')
-    user = users.pop(request.sid)
-    user = User.query.get(user)
-    if user:
-        user.is_active = False
-        db.session.commit()
-        graph = build_graph()
-        socketio.emit('logout', {'graph': graph})
+def connect_user():
+    print('connected: ', request.sid)
 
 
 @socketio.on('login')
 def login_user(data):
-    user = User.query.filter_by(username=data['username']).first()
+    user = User.query.get(data['username'])
+
+    # first ever visiting (new node of this user + total graph) / other users get push for node
     if not user:
         user = User(username=data['username'],
                     password=data['password'],
+                    session_id=request.sid,
                     is_active=True)
         db.session.add(user)
+        db.session.commit()
         chats = []
-    elif user.password == data['password']:
-        user.is_active = True
-        chats = load_chats(user)
-    else:
-        socketio.emit('login failed', 'wrong password')
-        return
-    users[request.sid] = user.username
-    db.session.commit()
-    join_room(user.username, sid=request.sid)
+        graph = build_graph()
+        join_room(user.username, sid=request.sid)
+        emit('registration', {'username': user.username, 'chats': chats, 'graph': graph}, to=user.username)
+        emit('new node', {'username': user.username, 'is_active': user.is_active}, broadcast=True, include_self=False)
 
-    graph = build_graph()
-    socketio.emit('login success', {'username': user.username, 'chats': chats, 'graph': graph}, room=user.username)
-    socketio.emit('graph', {'graph': graph, 'from': 'login'}, broadcast=True)
+    # log in (changing thus user status to active and sending total graph)
+    elif user.password == data['password']:
+        user.session_id = request.sid
+        user.is_active = True
+        db.session.commit()
+        chats = load_chats(user)
+        graph = build_graph()
+        join_room(user.username, sid=request.sid)
+        emit('login', {'username': user.username, 'chats': chats, 'graph': graph}, to=user.username)
+        emit('node active', {'username': user.username, 'is_active': user.is_active},
+             broadcast=True, include_self=False)
+
+    else:
+        emit('login failed', 'wrong password')
 
 
 @socketio.on('add chat')
 def add_chat(data):
-    current_user: User = User.query.get(data['current_user'])
+    # TODO forbid adding repeated entries
+    user: User = User.query.get(data['current_user'])
     new_contact: User = User.query.get(data['to_user'])
     if new_contact:
-        current_user.connects.append(new_contact)
-        db.session.commit()
-        chats = load_chats(current_user)
+        user.connects.append(new_contact)
+        new_contact.connects.append(user)
 
-        graph = build_graph()
-        socketio.emit('new connection added', {'username': current_user.username, 'chats': chats}, room=current_user.username)
-        socketio.emit('graph', {'graph': graph, 'from': 'add_chat'}, broadcast=True)
+        db.session.commit()
+        user_chats = load_chats(user)
+        contact_chats = load_chats(new_contact)
+
+        emit('add contact', user_chats, to=user.username)
+        emit('add contact', contact_chats, to=new_contact.username)
+
+        emit('new links', [{'source': user.username, 'target': new_contact.username},
+                           {'source': new_contact.username, 'target': user.username}], broadcast=True)
+
     else:
-        socketio.emit('no such user', 'no such user')
+        emit('contact does not exist', 'contact does not exist', to=user.username)
 
 
 @socketio.on('message')
 def message(data):
     dest: User = User.query.get(data['to'])
-    socketio.emit('message', data, room=dest.username)
+    emit('message', data, to=dest.username)
+    emit('msg visual', {'from': data['sender'], 'to': data['to']}, broadcast=True)
+
+
+@socketio.on('disconnect')
+def disconnect_user():
+    print('disconnected')
+    user = User.query.filter_by(session_id=request.sid).first()
+    if user:
+        user.session_id = None
+        user.is_active = False
+        db.session.commit()
+        close_room(user.username)
+        emit('node inactive', {'username': user.username, 'is_active': False}, broadcast=True, include_self=False)
 
 
 if __name__ == '__main__':
